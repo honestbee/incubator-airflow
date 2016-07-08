@@ -19,7 +19,7 @@ from __future__ import unicode_literals
 
 from past.builtins import basestring
 from collections import defaultdict, Counter
-from datetime import datetime
+from datetime import datetime, timedelta
 import getpass
 import logging
 import socket
@@ -116,7 +116,7 @@ class BaseJob(Base, LoggingMixin):
         '''
         pass
 
-    def heartbeat_callback(self):
+    def heartbeat_callback(self, session=None):
         pass
 
     def heartbeat(self):
@@ -139,7 +139,7 @@ class BaseJob(Base, LoggingMixin):
         sleep at all.
         '''
         session = settings.Session()
-        job = session.query(BaseJob).filter(BaseJob.id == self.id).first()
+        job = session.query(BaseJob).filter_by(id=self.id).one()
 
         if job.state == State.SHUTDOWN:
             self.kill()
@@ -154,9 +154,9 @@ class BaseJob(Base, LoggingMixin):
 
         session.merge(job)
         session.commit()
-        session.close()
 
-        self.heartbeat_callback()
+        self.heartbeat_callback(session=session)
+        session.close()
         self.logger.debug('[heart] Boom.')
 
     def run(self):
@@ -378,7 +378,8 @@ class SchedulerJob(BaseJob):
                 filename=filename, stacktrace=stacktrace))
         session.commit()
 
-    def schedule_dag(self, dag):
+    @provide_session
+    def schedule_dag(self, dag, session=None):
         """
         This method checks whether a new DagRun needs to be created
         for a DAG based on scheduling interval
@@ -386,22 +387,26 @@ class SchedulerJob(BaseJob):
         """
         if dag.schedule_interval:
             DagRun = models.DagRun
-            session = settings.Session()
             active_runs = DagRun.find(
                 dag_id=dag.dag_id,
                 state=State.RUNNING,
                 external_trigger=False,
                 session=session
             )
-            if len(active_runs) >= dag.max_active_runs:
+            # return if already reached maximum active runs and no timeout setting
+            if len(active_runs) >= dag.max_active_runs and not dag.dagrun_timeout:
                 return
+            timedout_runs = 0
             for dr in active_runs:
                 if (
                         dr.start_date and dag.dagrun_timeout and
                         dr.start_date < datetime.now() - dag.dagrun_timeout):
                     dr.state = State.FAILED
                     dr.end_date = datetime.now()
+                    timedout_runs += 1
             session.commit()
+            if len(active_runs) - timedout_runs >= dag.max_active_runs:
+                return
 
             # this query should be replaced by find dagrun
             qry = (
@@ -424,13 +429,21 @@ class SchedulerJob(BaseJob):
                 # First run
                 task_start_dates = [t.start_date for t in dag.tasks]
                 if task_start_dates:
-                    next_run_date = min(task_start_dates)
+                    next_run_date = dag.normalize_schedule(min(task_start_dates))
+                    self.logger.debug("Next run date based on tasks {}"
+                                      .format(next_run_date))
             else:
                 next_run_date = dag.following_schedule(last_scheduled_run)
 
             # don't ever schedule prior to the dag's start_date
             if dag.start_date:
-                next_run_date = dag.start_date if not next_run_date else max(next_run_date, dag.start_date)
+                next_run_date = (dag.start_date if not next_run_date
+                                 else max(next_run_date, dag.start_date))
+                if next_run_date == dag.start_date:
+                    next_run_date = dag.normalize_schedule(dag.start_date)
+
+                self.logger.debug("Dag start date: {}. Next run date: {}"
+                                  .format(dag.start_date, next_run_date))
 
             # this structure is necessary to avoid a TypeError from concatenating
             # NoneType
@@ -510,12 +523,13 @@ class SchedulerJob(BaseJob):
             if run.execution_date > datetime.now():
                 continue
 
-            # todo: run.task is transient but needs to be set
+            # todo: run.dag is transient but needs to be set
             run.dag = dag
             # todo: preferably the integrity check happens at dag collection time
             run.verify_integrity(session=session)
             run.update_state(session=session)
             if run.state == State.RUNNING:
+                make_transient(run)
                 active_dag_runs.append(run)
 
         for run in active_dag_runs:
@@ -538,20 +552,6 @@ class SchedulerJob(BaseJob):
 
                 if ti.is_runnable(flag_upstream_failed=True):
                     self.logger.debug('Queuing task: {}'.format(ti))
-
-                    ti.refresh_from_db(session=session, lock_for_update=True)
-                    # another scheduler could have picked this task
-                    # todo: UP_FOR_RETRY still could create a race condition
-                    if ti.state is State.SCHEDULED:
-                        session.commit()
-                        self.logger.debug("Task {} was picked up by another scheduler"
-                                          .format(ti))
-                        continue
-                    elif ti.state is State.NONE:
-                        ti.state = State.SCHEDULED
-                        session.merge(ti)
-
-                    session.commit()
                     queue.put((ti.key, pickle_id))
 
         session.close()
@@ -668,7 +668,28 @@ class SchedulerJob(BaseJob):
             except Exception as e:
                 self.logger.exception(e)
 
+    @provide_session
+    def _reset_state_for_orphaned_tasks(self, dag_run, session=None):
+        """
+        This function checks for a DagRun if there are any tasks
+        that have a scheduled state but are not known by the
+        executor. If it finds those it will reset the state to None
+        so they will get picked up again.
+        """
+        queued_tis = self.executor.queued_tasks
+
+        # also consider running as the state might not have changed in the db yet
+        running = self.executor.running
+        tis = dag_run.get_task_instances(state=State.SCHEDULED, session=session)
+        for ti in tis:
+            if ti.key not in queued_tis and ti.key not in running:
+                ti.state = State.NONE
+                self.logger.debug("Rescheduling orphaned task {}".format(ti))
+
+        session.commit()
+
     def _execute(self):
+        session = settings.Session()
         TI = models.TaskInstance
 
         pessimistic_connection_handling()
@@ -679,6 +700,16 @@ class SchedulerJob(BaseJob):
         dagbag = models.DagBag(self.subdir, sync_to_db=True)
         executor = self.executor = dagbag.executor
         executor.start()
+
+        # grab orphaned tasks and make sure to reset their state
+        active_runs = DagRun.find(
+            state=State.RUNNING,
+            external_trigger=False,
+            session=session
+        )
+        for dr in active_runs:
+            self._reset_state_for_orphaned_tasks(dr, session=session)
+
         self.runs = 0
         while not self.num_runs or self.num_runs > self.runs:
             try:
@@ -730,7 +761,19 @@ class SchedulerJob(BaseJob):
                         dag = dagbag.dags[ti_key[0]]
                         task = dag.get_task(ti_key[1])
                         ti = TI(task, ti_key[2])
+                        ti.refresh_from_db(session=session, lock_for_update=True)
+                        if ti.state == State.SCHEDULED:
+                            session.commit()
+                            self.logger.debug("Task {} was picked up by another scheduler"
+                                              .format(ti))
+                            continue
+                        elif ti.state is State.NONE:
+                            ti.state = State.SCHEDULED
+
                         self.executor.queue_task_instance(ti, pickle_id=pickle_id)
+
+                        session.merge(ti)
+                        session.commit()
 
                 for j in jobs:
                     j.join()
@@ -761,8 +804,10 @@ class SchedulerJob(BaseJob):
             finally:
                 settings.Session.remove()
         executor.end()
+        session.close()
 
-    def heartbeat_callback(self):
+    @provide_session
+    def heartbeat_callback(self, session=None):
         Stats.gauge('scheduler_heartbeat', 1, 1)
 
 
@@ -851,17 +896,16 @@ class BackfillJob(BaseJob):
                     ti.execution_date == (start_date or ti.start_date))
                 # The task was already marked successful or skipped by a
                 # different Job. Don't rerun it.
-                if key not in started:
-                    if ti.state == State.SUCCESS:
-                        succeeded.add(key)
-                        tasks_to_run.pop(key)
-                        session.commit()
-                        continue
-                    elif ti.state == State.SKIPPED:
-                        skipped.add(key)
-                        tasks_to_run.pop(key)
-                        session.commit()
-                        continue
+                if ti.state == State.SUCCESS:
+                    succeeded.add(key)
+                    tasks_to_run.pop(key)
+                    session.commit()
+                    continue
+                elif ti.state == State.SKIPPED:
+                    skipped.add(key)
+                    tasks_to_run.pop(key)
+                    session.commit()
+                    continue
 
                 # Is the task runnable? -- then run it
                 if ti.is_queueable(
@@ -1053,6 +1097,15 @@ class LocalTaskJob(BaseJob):
         self.pool = pool
         self.pickle_id = pickle_id
         self.mark_success = mark_success
+
+        # terminating state is used so that a job don't try to
+        # terminate multiple times
+        self.terminating = False
+
+        # Keeps track of the fact that the task instance has been observed
+        # as running at least once
+        self.was_running = False
+
         super(LocalTaskJob, self).__init__(*args, **kwargs)
 
     def _execute(self):
@@ -1075,23 +1128,26 @@ class LocalTaskJob(BaseJob):
     def on_kill(self):
         self.process.terminate()
 
-    """
-    def heartbeat_callback(self):
-        if datetime.now() - self.start_date < timedelta(seconds=300):
+    @provide_session
+    def heartbeat_callback(self, session=None):
+        """Self destruct task if state has been moved away from running externally"""
+
+        if self.terminating:
+            # task is already terminating, let it breathe
             return
+
         # Suicide pill
         TI = models.TaskInstance
         ti = self.task_instance
-        session = settings.Session()
         state = session.query(TI.state).filter(
             TI.dag_id==ti.dag_id, TI.task_id==ti.task_id,
             TI.execution_date==ti.execution_date).scalar()
-        session.commit()
-        session.close()
-        if state != State.RUNNING:
+        if state == State.RUNNING:
+            self.was_running = True
+        elif self.was_running and hasattr(self, 'process'):
             logging.warning(
                 "State of this instance has been externally set to "
                 "{self.task_instance.state}. "
                 "Taking the poison pill. So long.".format(**locals()))
             self.process.terminate()
-    """
+            self.terminating = True

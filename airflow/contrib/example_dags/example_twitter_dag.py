@@ -23,7 +23,9 @@
 # --------------------------------------------------------------------------------
 
 from airflow import DAG
-from airflow.operators import BashOperator, HiveOperator, PythonOperator
+from airflow.operators.bash_operator import BashOperator
+from airflow.operators.python_operator import PythonOperator
+from airflow.operators.hive_operator import HiveOperator
 from datetime import datetime, date, timedelta
 
 # --------------------------------------------------------------------------------
@@ -180,4 +182,3 @@ for channel in from_channels:
 
     load_to_hive.set_upstream(load_to_hdfs)
     load_to_hive.set_downstream(hive_to_mysql)
-

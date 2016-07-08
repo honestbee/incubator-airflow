@@ -1,9 +1,23 @@
+# -*- coding: utf-8 -*-
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 from builtins import str
 from past.builtins import basestring
 from datetime import datetime
 import numpy
 import logging
+import sys
 
 from airflow.hooks.base_hook import BaseHook
 from airflow.exceptions import AirflowException
@@ -53,6 +67,8 @@ class DbApiHook(BaseHook):
         :param parameters: The parameters to render the SQL query with.
         :type parameters: mapping or iterable
         '''
+        if sys.version_info[0] < 3:
+            sql = sql.encode('utf-8')
         import pandas.io.sql as psql
         conn = self.get_conn()
         df = psql.read_sql(sql, con=conn, params=parameters)
@@ -69,6 +85,8 @@ class DbApiHook(BaseHook):
         :param parameters: The parameters to render the SQL query with.
         :type parameters: mapping or iterable
         '''
+        if sys.version_info[0] < 3:
+            sql = sql.encode('utf-8')
         conn = self.get_conn()
         cur = self.get_cursor()
         if parameters is not None:
@@ -90,6 +108,8 @@ class DbApiHook(BaseHook):
         :param parameters: The parameters to render the SQL query with.
         :type parameters: mapping or iterable
         '''
+        if sys.version_info[0] < 3:
+            sql = sql.encode('utf-8')
         conn = self.get_conn()
         cur = conn.cursor()
         if parameters is not None:
@@ -125,6 +145,8 @@ class DbApiHook(BaseHook):
 
         cur = conn.cursor()
         for s in sql:
+            if sys.version_info[0] < 3:
+                s = s.encode('utf-8')
             logging.info(s)
             if parameters is not None:
                 cur.execute(s, parameters)

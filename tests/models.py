@@ -27,7 +27,9 @@ from airflow.exceptions import AirflowSkipException
 from airflow.models import DAG, TaskInstance as TI
 from airflow.models import State as ST
 from airflow.models import DagModel
-from airflow.operators import DummyOperator, BashOperator, PythonOperator
+from airflow.operators.dummy_operator import DummyOperator
+from airflow.operators.bash_operator import BashOperator
+from airflow.operators.python_operator import PythonOperator
 from airflow.utils.state import State
 from mock import patch
 from nose_parameterized import parameterized
@@ -419,6 +421,38 @@ class TaskInstanceTest(unittest.TestCase):
         self.assertEqual(ti.state, State.FAILED)
         self.assertEqual(ti.try_number, 4)
 
+    def test_next_retry_datetime(self):
+        delay = datetime.timedelta(seconds=3)
+        delay_squared = datetime.timedelta(seconds=9)
+        max_delay = datetime.timedelta(seconds=10)
+
+        dag = models.DAG(dag_id='fail_dag')
+        task = BashOperator(
+            task_id='task_with_exp_backoff_and_max_delay',
+            bash_command='exit 1',
+            retries=3,
+            retry_delay=delay,
+            retry_exponential_backoff=True,
+            max_retry_delay=max_delay,
+            dag=dag,
+            owner='airflow',
+            start_date=datetime.datetime(2016, 2, 1, 0, 0, 0))
+        ti = TI(
+            task=task, execution_date=datetime.datetime.now())
+        ti.end_date = datetime.datetime.now()
+
+        ti.try_number = 1
+        dt = ti.next_retry_datetime()
+        self.assertEqual(dt, ti.end_date+delay)
+
+        ti.try_number = 2
+        dt = ti.next_retry_datetime()
+        self.assertEqual(dt, ti.end_date+delay_squared)
+
+        ti.try_number = 3
+        dt = ti.next_retry_datetime()
+        self.assertEqual(dt, ti.end_date+max_delay)
+
     def test_depends_on_past(self):
         dagbag = models.DagBag()
         dag = dagbag.get_dag('test_depends_on_past')
@@ -555,7 +589,7 @@ class TaskInstanceTest(unittest.TestCase):
         ti.xcom_push(key=key, value=value)
         self.assertEqual(ti.xcom_pull(task_ids='test_xcom', key=key), value)
         ti.run()
-        exec_date = exec_date.replace(day=exec_date.day + 1)
+        exec_date += datetime.timedelta(days=1)
         ti = TI(
             task=task, execution_date=exec_date)
         ti.run()

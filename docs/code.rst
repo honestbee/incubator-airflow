@@ -90,13 +90,13 @@ Community-contributed Operators
 .. automodule:: airflow.contrib.operators
     :show-inheritance:
     :members:
-        BigQueryOperator,
-        BigQueryToCloudStorageOperator,
-        GoogleCloudStorageDownloadOperator,
         SSHExecuteOperator,
         VerticaOperator,
         VerticaToHiveTransfer
 
+.. autoclass:: airflow.contrib.operators.bigquery_operator.BigQueryOperator
+.. autoclass:: airflow.contrib.operators.bigquery_to_gcs.BigQueryToCloudStorageOperator
+.. autoclass:: airflow.contrib.operators.gcs_download_operator.GoogleCloudStorageDownloadOperator
 .. autoclass:: airflow.contrib.operators.QuboleOperator
 .. autoclass:: airflow.contrib.operators.hipchat_operator.HipChatAPIOperator
 .. autoclass:: airflow.contrib.operators.hipchat_operator.HipChatAPISendRoomNotificationOperator
@@ -133,6 +133,10 @@ Variable                            Description
 ``{{ latest_date }}``               same as ``{{ ds }}``
 ``{{ ti }}``                        same as ``{{ task_instance }}``
 ``{{ params }}``                    a reference to the user-defined params dictionary
+``{{ var.value.my_var }}``          global defined variables represented as a dictionary
+``{{ var.json.my_var.path }}``      global defined variables represented as a dictionary
+                                    with deserialized JSON object, append the path to the
+                                    key within the JSON object
 ``{{ task_instance_key_str }}``     a unique, human-readable key to the task instance
                                     formatted ``{dag_id}_{task_id}_{ds}``
 ``conf``                            the full configuration object located at
@@ -150,6 +154,11 @@ dot notation. Here are some examples of what is possible:
 ``{{ task.owner }}``, ``{{ task.task_id }}``, ``{{ ti.hostname }}``, ...
 Refer to the models documentation for more information on the objects'
 attributes and methods.
+
+The ``var`` template variable allows you to access variables defined in Airflow's
+UI. You can access them as either plain-text or JSON. If you use JSON, you are
+also able to walk nested structures, such as dictionaries like:
+``{{ var.json.my_dict_var.key1 }}``
 
 Macros
 ''''''
@@ -226,6 +235,8 @@ Community contributed hooks
         SSHHook,
         CloudantHook
 
+.. autoclass:: airflow.contrib.hooks.gcs_hook.GoogleCloudStorageHook
+
 Executors
 ---------
 Executors are the mechanism by which task instances get run.
@@ -237,7 +248,4 @@ Executors are the mechanism by which task instances get run.
 Community-contributed executors
 '''''''''''''''''''''''''''''''
 
-.. automodule:: airflow.contrib.executors
-    :show-inheritance:
-    :members:
-        MesosExecutor
+.. autoclass:: airflow.contrib.executors.mesos_executor.MesosExecutor

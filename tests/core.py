@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 from __future__ import print_function
 
 import doctest
@@ -18,6 +19,7 @@ import json
 import os
 import re
 import unittest
+import multiprocessing
 import mock
 import tempfile
 from datetime import datetime, time, timedelta
@@ -34,8 +36,17 @@ from airflow.executors import SequentialExecutor, LocalExecutor
 from airflow.models import Variable
 
 configuration.test_mode()
-from airflow import jobs, models, DAG, operators, hooks, utils, macros, settings, exceptions
-from airflow.hooks import BaseHook
+from airflow import jobs, models, DAG, utils, macros, settings, exceptions
+from airflow.models import BaseOperator
+from airflow.operators.bash_operator import BashOperator
+from airflow.operators.check_operator import CheckOperator, ValueCheckOperator
+from airflow.operators.dagrun_operator import TriggerDagRunOperator
+from airflow.operators.python_operator import PythonOperator
+from airflow.operators.dummy_operator import DummyOperator
+from airflow.operators.http_operator import SimpleHttpOperator
+from airflow.operators import sensors
+from airflow.hooks.base_hook import BaseHook
+from airflow.hooks.sqlite_hook import SqliteHook
 from airflow.bin import cli
 from airflow.www import app as application
 from airflow.settings import Session
@@ -48,7 +59,7 @@ from airflow.configuration import AirflowConfigException
 
 import six
 
-NUM_EXAMPLE_DAGS = 15
+NUM_EXAMPLE_DAGS = 16
 DEV_NULL = '/dev/null'
 TEST_DAG_FOLDER = os.path.join(
     os.path.dirname(os.path.realpath(__file__)), 'dags')
@@ -81,6 +92,20 @@ def reset(dag_id=TEST_DAG_ID):
 
 
 reset()
+
+
+class OperatorSubclass(BaseOperator):
+    """
+    An operator to test template substitution
+    """
+    template_fields = ['some_templated_field']
+
+    def __init__(self, some_templated_field, *args, **kwargs):
+        super(OperatorSubclass, self).__init__(*args, **kwargs)
+        self.some_templated_field = some_templated_field
+
+    def execute(*args, **kwargs):
+        pass
 
 
 class CoreTest(unittest.TestCase):
@@ -289,7 +314,7 @@ class CoreTest(unittest.TestCase):
         assert hash(self.dag) != hash(dag_subclass)
 
     def test_time_sensor(self):
-        t = operators.TimeSensor(
+        t = sensors.TimeSensor(
             task_id='time_sensor_check',
             target_time=time(0),
             dag=self.dag)
@@ -303,14 +328,14 @@ class CoreTest(unittest.TestCase):
         captainHook.run("CREATE TABLE operator_test_table (a, b)")
         captainHook.run("insert into operator_test_table values (1,2)")
 
-        t = operators.CheckOperator(
+        t = CheckOperator(
             task_id='check',
             sql="select count(*) from operator_test_table",
             conn_id=conn_id,
             dag=self.dag)
         t.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, force=True)
 
-        t = operators.ValueCheckOperator(
+        t = ValueCheckOperator(
             task_id='value_check',
             pass_value=95,
             tolerance=0.1,
@@ -334,7 +359,7 @@ class CoreTest(unittest.TestCase):
         Tests that Operators reject illegal arguments
         """
         with warnings.catch_warnings(record=True) as w:
-            t = operators.BashOperator(
+            t = BashOperator(
                 task_id='test_illegal_args',
                 bash_command='echo success',
                 dag=self.dag,
@@ -346,14 +371,14 @@ class CoreTest(unittest.TestCase):
                 w[0].message.args[0])
 
     def test_bash_operator(self):
-        t = operators.BashOperator(
+        t = BashOperator(
             task_id='time_sensor_check',
             bash_command="echo success",
             dag=self.dag)
         t.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, force=True)
 
     def test_bash_operator_multi_byte_output(self):
-        t = operators.BashOperator(
+        t = BashOperator(
             task_id='test_multi_byte_bash_operator',
             bash_command=u"echo \u2600",
             dag=self.dag,
@@ -365,7 +390,7 @@ class CoreTest(unittest.TestCase):
             if True:
                 return obj
 
-        t = operators.TriggerDagRunOperator(
+        t = TriggerDagRunOperator(
             task_id='test_trigger_dagrun',
             trigger_dag_id='example_bash_operator',
             python_callable=trigga,
@@ -373,28 +398,29 @@ class CoreTest(unittest.TestCase):
         t.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, force=True)
 
     def test_dryrun(self):
-        t = operators.BashOperator(
+        t = BashOperator(
             task_id='time_sensor_check',
             bash_command="echo success",
             dag=self.dag)
         t.dry_run()
 
     def test_sqlite(self):
-        t = operators.SqliteOperator(
+        import airflow.operators.sqlite_operator
+        t = airflow.operators.sqlite_operator.SqliteOperator(
             task_id='time_sqlite',
             sql="CREATE TABLE IF NOT EXISTS unitest (dummy VARCHAR(20))",
             dag=self.dag)
         t.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, force=True)
 
     def test_timedelta_sensor(self):
-        t = operators.TimeDeltaSensor(
+        t = sensors.TimeDeltaSensor(
             task_id='timedelta_sensor_check',
             delta=timedelta(seconds=2),
             dag=self.dag)
         t.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, force=True)
 
     def test_external_task_sensor(self):
-        t = operators.ExternalTaskSensor(
+        t = sensors.ExternalTaskSensor(
             task_id='test_external_task_sensor_check',
             external_dag_id=TEST_DAG_ID,
             external_task_id='time_sensor_check',
@@ -402,7 +428,7 @@ class CoreTest(unittest.TestCase):
         t.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, force=True)
 
     def test_external_task_sensor_delta(self):
-        t = operators.ExternalTaskSensor(
+        t = sensors.ExternalTaskSensor(
             task_id='test_external_task_sensor_check_delta',
             external_dag_id=TEST_DAG_ID,
             external_task_id='time_sensor_check',
@@ -411,8 +437,47 @@ class CoreTest(unittest.TestCase):
             dag=self.dag)
         t.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, force=True)
 
+    def test_external_task_sensor_fn(self):
+        self.test_time_sensor()
+        # check that the execution_fn works
+        t = sensors.ExternalTaskSensor(
+            task_id='test_external_task_sensor_check_delta',
+            external_dag_id=TEST_DAG_ID,
+            external_task_id='time_sensor_check',
+            execution_date_fn=lambda dt: dt + timedelta(0),
+            allowed_states=['success'],
+            dag=self.dag)
+        t.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, force=True)
+
+        # double check that the execution is being called by failing the test
+        t2 = sensors.ExternalTaskSensor(
+            task_id='test_external_task_sensor_check_delta',
+            external_dag_id=TEST_DAG_ID,
+            external_task_id='time_sensor_check',
+            execution_date_fn=lambda dt: dt + timedelta(days=1),
+            allowed_states=['success'],
+            timeout=1,
+            poke_interval=1,
+            dag=self.dag)
+        with self.assertRaises(exceptions.AirflowSensorTimeout):
+            t2.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, force=True)
+
+    def test_external_task_sensor_error_delta_and_fn(self):
+        """
+        Test that providing execution_delta and a function raises an error
+        """
+        with self.assertRaises(ValueError):
+            t = sensors.ExternalTaskSensor(
+                task_id='test_external_task_sensor_check_delta',
+                external_dag_id=TEST_DAG_ID,
+                external_task_id='time_sensor_check',
+                execution_delta=timedelta(0),
+                execution_date_fn=lambda dt: dt,
+                allowed_states=['success'],
+                dag=self.dag)
+
     def test_timeout(self):
-        t = operators.PythonOperator(
+        t = PythonOperator(
             task_id='test_timeout',
             execution_timeout=timedelta(seconds=1),
             python_callable=lambda: sleep(5),
@@ -427,7 +492,7 @@ class CoreTest(unittest.TestCase):
             if not templates_dict['ds'] == ds:
                 raise Exception("failure")
 
-        t = operators.PythonOperator(
+        t = PythonOperator(
             task_id='test_py_op',
             provide_context=True,
             python_callable=test_py_op,
@@ -436,29 +501,88 @@ class CoreTest(unittest.TestCase):
         t.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, force=True)
 
     def test_complex_template(self):
-        class OperatorSubclass(operators.BaseOperator):
-            template_fields = ['some_templated_field']
-
-            def __init__(self, some_templated_field, *args, **kwargs):
-                super(OperatorSubclass, self).__init__(*args, **kwargs)
-                self.some_templated_field = some_templated_field
-
-            def execute(*args, **kwargs):
-                pass
-
-        def test_some_templated_field_template_render(context):
+        def verify_templated_field(context):
             self.assertEqual(context['ti'].task.some_templated_field['bar'][1], context['ds'])
 
         t = OperatorSubclass(
             task_id='test_complex_template',
-            provide_context=True,
             some_templated_field={
                 'foo': '123',
                 'bar': ['baz', '{{ ds }}']
             },
-            on_success_callback=test_some_templated_field_template_render,
+            on_success_callback=verify_templated_field,
             dag=self.dag)
         t.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, force=True)
+
+    def test_template_with_variable(self):
+        """
+        Test the availability of variables in templates
+        """
+        val = {
+            'success':False,
+            'test_value': 'a test value'
+        }
+        Variable.set("a_variable", val['test_value'])
+
+        def verify_templated_field(context):
+            self.assertEqual(context['ti'].task.some_templated_field,
+                             val['test_value'])
+            val['success'] = True
+
+        t = OperatorSubclass(
+            task_id='test_complex_template',
+            some_templated_field='{{ var.value.a_variable }}',
+            on_success_callback=verify_templated_field,
+            dag=self.dag)
+        t.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, force=True)
+        assert val['success']
+
+    def test_template_with_json_variable(self):
+        """
+        Test the availability of variables (serialized as JSON) in templates
+        """
+        val = {
+            'success': False,
+            'test_value': {'foo': 'bar', 'obj': {'v1': 'yes', 'v2': 'no'}}
+        }
+        Variable.set("a_variable", val['test_value'], serialize_json=True)
+
+        def verify_templated_field(context):
+            self.assertEqual(context['ti'].task.some_templated_field,
+                             val['test_value']['obj']['v2'])
+            val['success'] = True
+
+        t = OperatorSubclass(
+            task_id='test_complex_template',
+            some_templated_field='{{ var.json.a_variable.obj.v2 }}',
+            on_success_callback=verify_templated_field,
+            dag=self.dag)
+        t.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, force=True)
+        assert val['success']
+
+    def test_template_with_json_variable_as_value(self):
+        """
+        Test the availability of variables (serialized as JSON) in templates, but
+        accessed as a value
+        """
+        val = {
+            'success': False,
+            'test_value': {'foo': 'bar'}
+        }
+        Variable.set("a_variable", val['test_value'], serialize_json=True)
+
+        def verify_templated_field(context):
+            self.assertEqual(context['ti'].task.some_templated_field,
+                             u'{"foo": "bar"}')
+            val['success'] = True
+
+        t = OperatorSubclass(
+            task_id='test_complex_template',
+            some_templated_field='{{ var.value.a_variable }}',
+            on_success_callback=verify_templated_field,
+            dag=self.dag)
+        t.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, force=True)
+        assert val['success']
 
     def test_import_examples(self):
         self.assertEqual(len(self.dagbag.dags), NUM_EXAMPLE_DAGS)
@@ -622,10 +746,49 @@ class CoreTest(unittest.TestCase):
 
     def test_bad_trigger_rule(self):
         with self.assertRaises(AirflowException):
-            operators.DummyOperator(
+            DummyOperator(
                 task_id='test_bad_trigger',
                 trigger_rule="non_existant",
                 dag=self.dag)
+
+    def test_terminate_task(self):
+        """If a task instance's db state get deleted, it should fail"""
+        TI = models.TaskInstance
+        dag = self.dagbag.dags.get('test_utils')
+        task = dag.task_dict.get('sleeps_forever')
+
+        ti = TI(task=task, execution_date=DEFAULT_DATE)
+        job = jobs.LocalTaskJob(
+            task_instance=ti, force=True, executor=SequentialExecutor())
+
+        # Running task instance asynchronously
+        p = multiprocessing.Process(target=job.run)
+        p.start()
+        sleep(5)
+        settings.engine.dispose()
+        session = settings.Session()
+        ti.refresh_from_db(session=session)
+        # making sure it's actually running
+        assert State.RUNNING == ti.state
+        ti = (
+            session.query(TI)
+            .filter_by(
+                dag_id=task.dag_id,
+                task_id=task.task_id,
+                execution_date=DEFAULT_DATE)
+            .one()
+        )
+        # deleting the instance should result in a failure
+        session.delete(ti)
+        session.commit()
+        # waiting for the async task to finish
+        p.join()
+
+        # making sure that the task ended up as failed
+        ti.refresh_from_db(session=session)
+        assert State.FAILED == ti.state
+        session.close()
+
 
 class CliTests(unittest.TestCase):
     def setUp(self):
@@ -783,32 +946,13 @@ class WebUiTests(unittest.TestCase):
         response = self.app.get(
             '/admin/airflow/tree?num_runs=25&dag_id=example_bash_operator')
         assert "runme_0" in response.data.decode('utf-8')
-        # new Chartkick.LineChart(document.getElementById("chart-0"), [{"data": [["2015-11-17T16:53:08.652950", 9.866944444444444e-06]], "name": "run_after_loop"}, {"data": [["2015-11-17T16:53:08.652950", 0.0002858047222222222], ["2015-11-17T16:56:09.698921", 0.00028737944444444445]], "name": "runme_0"}, {"data": [["2015-11-17T16:53:08.652950", 0.0002863941666666666], ["2015-11-17T16:56:09.698921", 0.00029015249999999996]], "name": "runme_1"}, {"data": [["2015-11-17T16:53:08.652950", 0.0002860847222222222], ["2015-11-17T16:56:09.698921", 0.00029001583333333335]], "name": "runme_2"}, {"data": [["2015-11-17T16:53:08.652950", 8.166944444444444e-06], ["2015-11-17T16:56:09.698921", 1.2806944444444445e-05]], "name": "also_run_this"}], {"library": {"yAxis": {"title": {"text": "hours"}}}, "height": "700px"});
-
-        chartkick_regexp = 'new Chartkick.LineChart\(document.getElementById\("chart-\d+"\),(.+)\)\;'
         response = self.app.get(
             '/admin/airflow/duration?days=30&dag_id=example_bash_operator')
         assert "example_bash_operator" in response.data.decode('utf-8')
-
-        chartkick_matched = re.search(chartkick_regexp,
-                                      response.data.decode('utf-8'))
-        assert chartkick_matched is not None, "chartkick_matched was none. Expected regex is: %s\nResponse was: %s" % (
-            chartkick_regexp,
-            response.data.decode('utf-8'))
-
-        # test that parameters to LineChart are well-formed json
-        try:
-            json.loads('[%s]' % chartkick_matched.group(1))
-        except e:
-            assert False, "Exception while json parsing LineChart parameters: %s" % e
-
         response = self.app.get(
             '/admin/airflow/landing_times?'
             'days=30&dag_id=example_bash_operator')
         assert "example_bash_operator" in response.data.decode('utf-8')
-        chartkick_matched = re.search(chartkick_regexp,
-                                      response.data.decode('utf-8'))
-        assert chartkick_matched is not None
         response = self.app.get(
             '/admin/airflow/gantt?dag_id=example_bash_operator')
         assert "example_bash_operator" in response.data.decode('utf-8')
@@ -1078,95 +1222,37 @@ class WebLdapAuthTest(unittest.TestCase):
         configuration.conf.set("webserver", "authenticate", "False")
 
 
-if 'MySqlOperator' in dir(operators):
-    # Only testing if the operator is installed
-    class MySqlTest(unittest.TestCase):
-        def setUp(self):
-            configuration.test_mode()
-            args = {
-                'owner': 'airflow',
-                'mysql_conn_id': 'airflow_db',
-                'start_date': DEFAULT_DATE
-            }
-            dag = DAG(TEST_DAG_ID, default_args=args)
-            self.dag = dag
+class LdapGroupTest(unittest.TestCase):
+    def setUp(self):
+        configuration.conf.set("webserver", "authenticate", "True")
+        configuration.conf.set("webserver", "auth_backend", "airflow.contrib.auth.backends.ldap_auth")
+        try:
+            configuration.conf.add_section("ldap")
+        except:
+            pass
+        configuration.conf.set("ldap", "uri", "ldap://localhost:3890")
+        configuration.conf.set("ldap", "user_filter", "objectClass=*")
+        configuration.conf.set("ldap", "user_name_attr", "uid")
+        configuration.conf.set("ldap", "bind_user", "cn=Manager,dc=example,dc=com")
+        configuration.conf.set("ldap", "bind_password", "insecure")
+        configuration.conf.set("ldap", "basedn", "dc=example,dc=com")
+        configuration.conf.set("ldap", "cacert", "")
 
-        def mysql_operator_test(self):
-            sql = """
-            CREATE TABLE IF NOT EXISTS test_airflow (
-                dummy VARCHAR(50)
-            );
-            """
-            t = operators.MySqlOperator(
-                task_id='basic_mysql',
-                sql=sql,
-                mysql_conn_id='airflow_db',
-                dag=self.dag)
-            t.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, force=True)
+    def test_group_belonging(self):
+        from airflow.contrib.auth.backends.ldap_auth import LdapUser
+        users = {"user1": ["group1", "group3"],
+                 "user2": ["group2"]
+                 }
+        for user in users:
+            mu = models.User(username=user,
+                             is_superuser=False)
+            auth = LdapUser(mu)
+            assert set(auth.ldap_groups) == set(users[user])
 
-        def mysql_operator_test_multi(self):
-            sql = [
-                "TRUNCATE TABLE test_airflow",
-                "INSERT INTO test_airflow VALUES ('X')",
-            ]
-            t = operators.MySqlOperator(
-                task_id='mysql_operator_test_multi',
-                mysql_conn_id='airflow_db',
-                sql=sql, dag=self.dag)
-            t.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, force=True)
+    def tearDown(self):
+        configuration.test_mode()
+        configuration.conf.set("webserver", "authenticate", "False")
 
-        def test_mysql_to_mysql(self):
-            sql = "SELECT * FROM INFORMATION_SCHEMA.TABLES LIMIT 100;"
-            t = operators.GenericTransfer(
-                task_id='test_m2m',
-                preoperator=[
-                    "DROP TABLE IF EXISTS test_mysql_to_mysql",
-                    "CREATE TABLE IF NOT EXISTS "
-                    "test_mysql_to_mysql LIKE INFORMATION_SCHEMA.TABLES"
-                ],
-                source_conn_id='airflow_db',
-                destination_conn_id='airflow_db',
-                destination_table="test_mysql_to_mysql",
-                sql=sql,
-                dag=self.dag)
-            t.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, force=True)
-
-        def test_sql_sensor(self):
-            t = operators.SqlSensor(
-                task_id='sql_sensor_check',
-                conn_id='mysql_default',
-                sql="SELECT count(1) FROM INFORMATION_SCHEMA.TABLES",
-                dag=self.dag)
-            t.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, force=True)
-
-if 'PostgresOperator' in dir(operators):
-    # Only testing if the operator is installed
-    class PostgresTest(unittest.TestCase):
-        def setUp(self):
-            configuration.test_mode()
-            args = {'owner': 'airflow', 'start_date': DEFAULT_DATE}
-            dag = DAG(TEST_DAG_ID, default_args=args)
-            self.dag = dag
-
-        def postgres_operator_test(self):
-            sql = """
-            CREATE TABLE IF NOT EXISTS test_airflow (
-                dummy VARCHAR(50)
-            );
-            """
-            t = operators.PostgresOperator(
-                task_id='basic_postgres', sql=sql, dag=self.dag)
-            t.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, force=True)
-
-            autocommitTask = operators.PostgresOperator(
-                task_id='basic_postgres_with_autocommit',
-                sql=sql,
-                dag=self.dag,
-                autocommit=True)
-            autocommitTask.run(
-                start_date=DEFAULT_DATE,
-                end_date=DEFAULT_DATE,
-                force=True)
 
 class FakeSession(object):
     def __init__(self):
@@ -1190,7 +1276,7 @@ class HttpOpSensorTest(unittest.TestCase):
 
     @mock.patch('requests.Session', FakeSession)
     def test_get(self):
-        t = operators.SimpleHttpOperator(
+        t = SimpleHttpOperator(
             task_id='get_op',
             method='GET',
             endpoint='/search',
@@ -1201,7 +1287,7 @@ class HttpOpSensorTest(unittest.TestCase):
 
     @mock.patch('requests.Session', FakeSession)
     def test_get_response_check(self):
-        t = operators.SimpleHttpOperator(
+        t = SimpleHttpOperator(
             task_id='get_op',
             method='GET',
             endpoint='/search',
@@ -1213,7 +1299,7 @@ class HttpOpSensorTest(unittest.TestCase):
 
     @mock.patch('requests.Session', FakeSession)
     def test_sensor(self):
-        sensor = operators.HttpSensor(
+        sensor = sensors.HttpSensor(
             task_id='http_sensor_check',
             conn_id='http_default',
             endpoint='/search',
@@ -1235,15 +1321,6 @@ class FakeWebHDFSHook(object):
     def check_for_path(self, hdfs_path):
         return hdfs_path
 
-class WebHdfsSensorTest(unittest.TestCase):
-
-    @mock.patch('airflow.hooks.WebHDFSHook', FakeWebHDFSHook)
-    def test_poke(self):
-        s = operators.WebHdfsSensor(filepath='fakepath',
-                                    task_id='webhdfs_sensor_check',
-                                    owner='webhdfs')
-        assert s.poke({}) == 'fakepath'
-
 class ConnectionTest(unittest.TestCase):
     def setUp(self):
         configuration.test_mode()
@@ -1260,7 +1337,7 @@ class ConnectionTest(unittest.TestCase):
                 del os.environ[ev]
 
     def test_using_env_var(self):
-        c = hooks.SqliteHook.get_connection(conn_id='test_uri')
+        c = SqliteHook.get_connection(conn_id='test_uri')
         assert c.host == 'ec2.compute.com'
         assert c.schema == 'the_database'
         assert c.login == 'username'
@@ -1268,7 +1345,7 @@ class ConnectionTest(unittest.TestCase):
         assert c.port == 5432
 
     def test_using_unix_socket_env_var(self):
-        c = hooks.SqliteHook.get_connection(conn_id='test_uri_no_creds')
+        c = SqliteHook.get_connection(conn_id='test_uri_no_creds')
         assert c.host == 'ec2.compute.com'
         assert c.schema == 'the_database'
         assert c.login is None
@@ -1286,12 +1363,12 @@ class ConnectionTest(unittest.TestCase):
         assert c.port is None
 
     def test_env_var_priority(self):
-        c = hooks.SqliteHook.get_connection(conn_id='airflow_db')
+        c = SqliteHook.get_connection(conn_id='airflow_db')
         assert c.host != 'ec2.compute.com'
 
         os.environ['AIRFLOW_CONN_AIRFLOW_DB'] = \
             'postgres://username:password@ec2.compute.com:5432/the_database'
-        c = hooks.SqliteHook.get_connection(conn_id='airflow_db')
+        c = SqliteHook.get_connection(conn_id='airflow_db')
         assert c.host == 'ec2.compute.com'
         assert c.schema == 'the_database'
         assert c.login == 'username'
@@ -1315,15 +1392,21 @@ class WebHDFSHookTest(unittest.TestCase):
         assert c.proxy_user == 'someone'
 
 
-@unittest.skipUnless("S3Hook" in dir(hooks),
-                     "Skipping test because S3Hook is not installed")
+try:
+    from airflow.hooks.S3_hook import S3Hook
+except ImportError:
+    S3Hook = None
+
+
+@unittest.skipIf(S3Hook is None,
+                 "Skipping test because S3Hook is not installed")
 class S3HookTest(unittest.TestCase):
     def setUp(self):
         configuration.test_mode()
         self.s3_test_url = "s3://test/this/is/not/a-real-key.txt"
 
     def test_parse_s3_url(self):
-        parsed = hooks.S3Hook.parse_s3_url(self.s3_test_url)
+        parsed = S3Hook.parse_s3_url(self.s3_test_url)
         self.assertEqual(parsed,
                          ("test", "this/is/not/a-real-key.txt"),
                          "Incorrect parsing of the s3 url")
@@ -1461,225 +1544,6 @@ class EmailSmtpTest(unittest.TestCase):
         utils.email.send_MIME_email('from', 'to', MIMEMultipart(), dryrun=True)
         assert not mock_smtp.called
         assert not mock_smtp_ssl.called
-
-
-if 'HiveOperator' in dir(operators):
-    class HiveServer2Test(unittest.TestCase):
-        def setUp(self):
-            configuration.test_mode()
-
-        def test_select_conn(self):
-            from airflow.hooks.hive_hooks import HiveServer2Hook
-            sql = "select 1"
-            hook = HiveServer2Hook()
-            hook.get_records(sql)
-
-        def test_get_metastore_databases(self):
-            if six.PY2:
-                from airflow.hooks.hive_hooks import HiveMetastoreHook
-                hook = HiveMetastoreHook()
-                hook.get_databases()
-
-        def test_to_csv(self):
-            from airflow.hooks.hive_hooks import HiveServer2Hook
-            sql = "select 1"
-            hook = HiveServer2Hook()
-            hook.to_csv(hql=sql, csv_filepath="/tmp/test_to_csv")
-
-if 'MySqlOperator' in dir(operators) and 'HiveOperator' in dir(operators):
-    class TransferTests(unittest.TestCase):
-        cluster = None
-
-        def setUp(self):
-            configuration.test_mode()
-            args = {'owner': 'airflow', 'start_date': DEFAULT_DATE_ISO}
-            dag = DAG(TEST_DAG_ID, default_args=args)
-            self.dag = dag
-
-        def test_clear(self):
-            self.dag.clear(start_date=DEFAULT_DATE, end_date=datetime.now())
-
-        def test_mysql_to_hive(self):
-            # import airflow.operators
-            from airflow.operators.mysql_to_hive import MySqlToHiveTransfer
-            sql = "SELECT * FROM baby_names LIMIT 1000;"
-            t = MySqlToHiveTransfer(
-                task_id='test_m2h',
-                mysql_conn_id='airflow_ci',
-                hive_cli_conn_id='beeline_default',
-                sql=sql,
-                hive_table='test_mysql_to_hive',
-                recreate=True,
-                delimiter=",",
-                dag=self.dag)
-            t.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, force=True)
-
-        def test_mysql_to_hive_partition(self):
-            from airflow.operators.mysql_to_hive import MySqlToHiveTransfer
-            sql = "SELECT * FROM baby_names LIMIT 1000;"
-            t = MySqlToHiveTransfer(
-                task_id='test_m2h',
-                mysql_conn_id='airflow_ci',
-                hive_cli_conn_id='beeline_default',
-                sql=sql,
-                hive_table='test_mysql_to_hive_part',
-                partition={'ds': DEFAULT_DATE_DS},
-                recreate=False,
-                create=True,
-                delimiter=",",
-                dag=self.dag)
-            t.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, force=True)
-
-if 'AIRFLOW_RUNALL_TESTS' in os.environ:
-
-    class HivePrestoTest(unittest.TestCase):
-
-        def setUp(self):
-            configuration.test_mode()
-            args = {'owner': 'airflow', 'start_date': DEFAULT_DATE}
-            dag = DAG(TEST_DAG_ID, default_args=args)
-            self.dag = dag
-            self.hql = """
-            USE airflow;
-            DROP TABLE IF EXISTS static_babynames_partitioned;
-            CREATE TABLE IF NOT EXISTS static_babynames_partitioned (
-                state string,
-                year string,
-                name string,
-                gender string,
-                num int)
-            PARTITIONED BY (ds string);
-            INSERT OVERWRITE TABLE static_babynames_partitioned
-                PARTITION(ds='{{ ds }}')
-            SELECT state, year, name, gender, num FROM static_babynames;
-            """
-
-        def test_hive(self):
-            t = operators.HiveOperator(
-                task_id='basic_hql', hql=self.hql, dag=self.dag)
-            t.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, force=True)
-
-        def test_hive_dryrun(self):
-            t = operators.HiveOperator(
-                task_id='basic_hql', hql=self.hql, dag=self.dag)
-            t.dry_run()
-
-        def test_beeline(self):
-            t = operators.HiveOperator(
-                task_id='beeline_hql', hive_cli_conn_id='beeline_default',
-                hql=self.hql, dag=self.dag)
-            t.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, force=True)
-
-        def test_presto(self):
-            sql = """
-            SELECT count(1) FROM airflow.static_babynames_partitioned;
-            """
-            t = operators.PrestoCheckOperator(
-                task_id='presto_check', sql=sql, dag=self.dag)
-            t.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, force=True)
-
-
-    def test_presto_to_mysql(self):
-        t = operators.PrestoToMySqlTransfer(
-            task_id='presto_to_mysql_check',
-            sql="""
-            SELECT name, count(*) as ccount
-            FROM airflow.static_babynames
-            GROUP BY name
-            """,
-            mysql_table='test_static_babynames',
-            mysql_preoperator='TRUNCATE TABLE test_static_babynames;',
-            dag=self.dag)
-        t.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, force=True)
-
-
-    def test_presto_to_mysql(self):
-        t = operators.PrestoToMySqlTransfer(
-            task_id='presto_to_mysql_check',
-            sql="""
-            SELECT name, count(*) as ccount
-            FROM airflow.static_babynames
-            GROUP BY name
-            """,
-            mysql_table='test_static_babynames',
-            mysql_preoperator='TRUNCATE TABLE test_static_babynames;',
-            dag=self.dag)
-        t.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, force=True)
-
-        def test_hdfs_sensor(self):
-            t = operators.HdfsSensor(
-                task_id='hdfs_sensor_check',
-                filepath='hdfs://user/hive/warehouse/airflow.db/static_babynames',
-                dag=self.dag)
-            t.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, force=True)
-
-        def test_webhdfs_sensor(self):
-            t = operators.WebHdfsSensor(
-                task_id='webhdfs_sensor_check',
-                filepath='hdfs://user/hive/warehouse/airflow.db/static_babynames',
-                timeout=120,
-                dag=self.dag)
-            t.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, force=True)
-
-        def test_sql_sensor(self):
-            t = operators.SqlSensor(
-                task_id='hdfs_sensor_check',
-                conn_id='presto_default',
-                sql="SELECT 'x' FROM airflow.static_babynames LIMIT 1;",
-                dag=self.dag)
-            t.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, force=True)
-
-        def test_hive_stats(self):
-            t = operators.HiveStatsCollectionOperator(
-                task_id='hive_stats_check',
-                table="airflow.static_babynames_partitioned",
-                partition={'ds': DEFAULT_DATE_DS},
-                dag=self.dag)
-            t.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, force=True)
-
-        def test_hive_partition_sensor(self):
-            t = operators.HivePartitionSensor(
-                task_id='hive_partition_check',
-                table='airflow.static_babynames_partitioned',
-                dag=self.dag)
-            t.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, force=True)
-
-        def test_hive_metastore_sql_sensor(self):
-            t = operators.MetastorePartitionSensor(
-                task_id='hive_partition_check',
-                table='airflow.static_babynames_partitioned',
-                partition_name='ds={}'.format(DEFAULT_DATE_DS),
-                dag=self.dag)
-            t.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, force=True)
-
-        def test_hive2samba(self):
-            if 'Hive2SambaOperator' in dir(operators):
-                t = operators.Hive2SambaOperator(
-                    task_id='hive2samba_check',
-                    samba_conn_id='tableau_samba',
-                    hql="SELECT * FROM airflow.static_babynames LIMIT 10000",
-                    destination_filepath='test_airflow.csv',
-                    dag=self.dag)
-                t.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, force=True)
-
-        def test_hive_to_mysql(self):
-            t = operators.HiveToMySqlTransfer(
-                mysql_conn_id='airflow_db',
-                task_id='hive_to_mysql_check',
-                create=True,
-                sql="""
-                SELECT name
-                FROM airflow.static_babynames
-                LIMIT 100
-                """,
-                mysql_table='test_static_babynames',
-                mysql_preoperator=[
-                    'DROP TABLE IF EXISTS test_static_babynames;',
-                    'CREATE TABLE test_static_babynames (name VARCHAR(500))',
-                ],
-                dag=self.dag)
-            t.clear(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE)
-            t.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, force=True)
 
 if __name__ == '__main__':
     unittest.main()

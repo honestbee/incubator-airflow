@@ -118,6 +118,7 @@ defaults = {
         'web_server_worker_timeout': 120,
         'authenticate': False,
         'filter_by_owner': False,
+        'owner_mode': 'user',
         'demo_mode': False,
         'secret_key': 'airflowified',
         'expose_config': False,
@@ -142,6 +143,7 @@ defaults = {
         'celery_result_backend': 'db+mysql://airflow:airflow@localhost:3306/airflow',
         'celeryd_concurrency': 16,
         'default_queue': 'default',
+        'flower_host': '0.0.0.0',
         'flower_port': '5555',
         'worker_log_server_port': '8793',
     },
@@ -293,6 +295,13 @@ authenticate = False
 # Filter the list of dags by owner name (requires authentication to be enabled)
 filter_by_owner = False
 
+# Filtering mode. Choices include user (default) and ldapgroup.
+# Ldap group filtering requires using the ldap backend
+#
+# Note that the ldap server needs the "memberOf" overlay to be set up
+# in order to user the ldapgroup mode.
+owner_mode = user
+
 [email]
 email_backend = airflow.utils.email.send_email_smtp
 
@@ -337,7 +346,10 @@ broker_url = sqla+mysql://airflow:airflow@localhost:3306/airflow
 celery_result_backend = db+mysql://airflow:airflow@localhost:3306/airflow
 
 # Celery Flower is a sweet UI for Celery. Airflow has a shortcut to start
-# it `airflow flower`. This defines the port that Celery Flower runs on
+# it `airflow flower`. This defines the IP that Celery Flower runs on
+flower_host = 0.0.0.0
+
+# This defines the port that Celery Flower runs on
 flower_port = 5555
 
 # Default queue that tasks get assigned to and that worker listen on.
@@ -447,6 +459,7 @@ celeryd_concurrency = 16
 worker_log_server_port = 8793
 broker_url = sqla+mysql://airflow:airflow@localhost:3306/airflow
 celery_result_backend = db+mysql://airflow:airflow@localhost:3306/airflow
+flower_host = 0.0.0.0
 flower_port = 5555
 default_queue = default
 
@@ -481,6 +494,22 @@ class ConfigParserWithDefaults(ConfigParser):
                 "sqlite" in self.get('core', 'sql_alchemy_conn')):
             raise AirflowConfigException("error: cannot use sqlite with the {}".
                 format(self.get('core', 'executor')))
+
+        elif (
+            self.getboolean("webserver", "authenticate") and
+            self.get("webserver", "owner_mode") not in ['user', 'ldapgroup']
+        ):
+            raise AirflowConfigException("error: owner_mode option should be either "
+                                         "'user' or 'ldapgroup' "
+                                         "when filtering by owner is set")
+
+        elif (
+            self.getboolean("webserver", "authenticate") and
+            self.get("webserver", "owner_mode").lower() == 'ldapgroup' and
+            self.get("core", "auth_backend") != 'airflow.contrib.auth.backends.ldap_auth'
+        ):
+            raise AirflowConfigException("error: attempt at using ldapgroup "
+                                         "filtering without using the Ldap backend")
 
         self.is_validated = True
 

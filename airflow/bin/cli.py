@@ -1,4 +1,18 @@
 #!/usr/bin/env python
+# -*- coding: utf-8 -*-
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import print_function
 import logging
 import os
@@ -588,6 +602,7 @@ def version(args):  # noqa
 
 def flower(args):
     broka = conf.get('celery', 'BROKER_URL')
+    address = '--address={}'.format(args.hostname)
     port = '--port={}'.format(args.port)
     api = ''
     if args.broker_api:
@@ -605,7 +620,7 @@ def flower(args):
         )
 
         with ctx:
-            os.execvp("flower", ['flower', '-b', broka, port, api])
+            os.execvp("flower", ['flower', '-b', broka, address, port, api])
 
         stdout.close()
         stderr.close()
@@ -613,7 +628,7 @@ def flower(args):
         signal.signal(signal.SIGINT, sigint_handler)
         signal.signal(signal.SIGTERM, sigint_handler)
 
-        os.execvp("flower", ['flower', '-b', broka, port, api])
+        os.execvp("flower", ['flower', '-b', broka, address, port, api])
 
 
 def kerberos(args):  # noqa
@@ -856,6 +871,10 @@ class CLIFactory(object):
             default=conf.get('celery', 'celeryd_concurrency')),
         # flower
         'broker_api': Arg(("-a", "--broker_api"), help="Broker api"),
+        'flower_hostname': Arg(
+            ("-hn", "--hostname"),
+            default=conf.get('celery', 'FLOWER_HOST'),
+            help="Set the hostname on which to run the server"),
         'flower_port': Arg(
             ("-p", "--port"),
             default=conf.get('celery', 'FLOWER_PORT'),
@@ -973,7 +992,7 @@ class CLIFactory(object):
         }, {
             'func': flower,
             'help': "Start a Celery Flower",
-            'args': ('flower_port', 'broker_api',
+            'args': ('flower_hostname', 'flower_port', 'broker_api',
                      'pid', 'daemon', 'stdout', 'stderr', 'log_file'),
         }, {
             'func': version,

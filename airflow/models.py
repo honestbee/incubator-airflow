@@ -596,33 +596,43 @@ class Connection(Base):
                        descriptor=property(cls.get_extra, cls.set_extra))
 
     def get_hook(self):
-        from airflow import hooks
-        from airflow.contrib import hooks as contrib_hooks
         try:
             if self.conn_type == 'mysql':
-                return hooks.MySqlHook(mysql_conn_id=self.conn_id)
+                from airflow.hooks.mysql_hook import MySqlHook
+                return MySqlHook(mysql_conn_id=self.conn_id)
             elif self.conn_type == 'google_cloud_platform':
-                return contrib_hooks.BigQueryHook(bigquery_conn_id=self.conn_id)
+                from airflow.contrib.hooks.bigquery_hook import BigQueryHook
+                return BigQueryHook(bigquery_conn_id=self.conn_id)
             elif self.conn_type == 'postgres':
-                return hooks.PostgresHook(postgres_conn_id=self.conn_id)
+                from airflow.hooks.postgres_hook import PostgresHook
+                return PostgresHook(postgres_conn_id=self.conn_id)
             elif self.conn_type == 'hive_cli':
-                return hooks.HiveCliHook(hive_cli_conn_id=self.conn_id)
+                from airflow.hooks.hive_hooks import HiveCliHook
+                return HiveCliHook(hive_cli_conn_id=self.conn_id)
             elif self.conn_type == 'presto':
-                return hooks.PrestoHook(presto_conn_id=self.conn_id)
+                from airflow.hooks.presto_hook import PrestoHook
+                return PrestoHook(presto_conn_id=self.conn_id)
             elif self.conn_type == 'hiveserver2':
-                return hooks.HiveServer2Hook(hiveserver2_conn_id=self.conn_id)
+                from airflow.hooks.hive_hooks import HiveServer2Hook
+                return HiveServer2Hook(hiveserver2_conn_id=self.conn_id)
             elif self.conn_type == 'sqlite':
-                return hooks.SqliteHook(sqlite_conn_id=self.conn_id)
+                from airflow.hooks.sqlite_hook import SqliteHook
+                return SqliteHook(sqlite_conn_id=self.conn_id)
             elif self.conn_type == 'jdbc':
-                return hooks.JdbcHook(jdbc_conn_id=self.conn_id)
+                from airflow.hooks.jdbc_hook import JdbcHook
+                return JdbcHook(jdbc_conn_id=self.conn_id)
             elif self.conn_type == 'mssql':
-                return hooks.MsSqlHook(mssql_conn_id=self.conn_id)
+                from airflow.hooks.mssql_hook import MsSqlHook
+                return MsSqlHook(mssql_conn_id=self.conn_id)
             elif self.conn_type == 'oracle':
-                return hooks.OracleHook(oracle_conn_id=self.conn_id)
+                from airflow.hooks.oracle_hook import OracleHook
+                return OracleHook(oracle_conn_id=self.conn_id)
             elif self.conn_type == 'vertica':
-                return contrib_hooks.VerticaHook(vertica_conn_id=self.conn_id)
+                from airflow.contrib.hooks.vertica_hook import VerticaHook
+                return VerticaHook(vertica_conn_id=self.conn_id)
             elif self.conn_type == 'cloudant':
-                return contrib_hooks.CloudantHook(cloudant_conn_id=self.conn_id)
+                from airflow.contrib.hooks.cloudant_hook import CloudantHook
+                return CloudantHook(cloudant_conn_id=self.conn_id)
         except:
             return None
 
@@ -705,6 +715,7 @@ class TaskInstance(Base):
 
     __table_args__ = (
         Index('ti_dag_state', dag_id, state),
+        Index('ti_state', state),
         Index('ti_state_lkp', dag_id, task_id, execution_date, state),
         Index('ti_pool', pool, state, priority_weight),
     )
@@ -826,8 +837,8 @@ class TaskInstance(Base):
         Refreshes the task instance from the database based on the primary key
 
         :param lock_for_update: if True, indicates that the database should
-        lock the TaskInstance (issuing a FOR UPDATE clause) until the session
-        is committed.
+            lock the TaskInstance (issuing a FOR UPDATE clause) until the
+            session is committed.
         """
         TI = TaskInstance
 
@@ -1134,13 +1145,26 @@ class TaskInstance(Base):
             "{ti.execution_date} [{ti.state}]>"
         ).format(ti=self)
 
+    def next_retry_datetime(self):
+        """
+        Get datetime of the next retry if the task instance fails. For exponential
+        backoff, retry_delay is used as base and will be converted to seconds.
+        """
+        delay = self.task.retry_delay
+        if self.task.retry_exponential_backoff:
+            delay_backoff_in_seconds = delay.total_seconds() ** self.try_number
+            delay = timedelta(seconds=delay_backoff_in_seconds)
+            if self.task.max_retry_delay:
+                delay = min(self.task.max_retry_delay, delay)
+        return self.end_date + delay
+
+
     def ready_for_retry(self):
         """
         Checks on whether the task instance is in the right state and timeframe
         to be retried.
         """
-        return self.state == State.UP_FOR_RETRY and \
-            self.end_date + self.task.retry_delay < datetime.now()
+        return self.state == State.UP_FOR_RETRY and self.next_retry_datetime() < datetime.now()
 
     @provide_session
     def pool_full(self, session):
@@ -1169,17 +1193,32 @@ class TaskInstance(Base):
     def run(
             self,
             verbose=True,
-            ignore_dependencies=False,  # Doesn't check for deps, just runs
-            ignore_depends_on_past=False,   # Ignore depends_on_past but respect
-                                            # other deps
-            force=False,  # Disregards previous successes
-            mark_success=False,  # Don't run the task, act as if it succeeded
-            test_mode=False,  # Doesn't record success or failure in the DB
+            ignore_dependencies=False,
+            ignore_depends_on_past=False,
+            force=False,
+            mark_success=False,
+            test_mode=False,
             job_id=None,
             pool=None,
             session=None):
         """
         Runs the task instance.
+
+        :param verbose: whether to turn on more verbose loggin
+        :type verbose: boolean
+        :param ignore_dependencies: Doesn't check for deps, just runs
+        :type ignore_dependencies: boolean
+        :param ignore_depends_on_past: Ignore depends_on_past but respect
+            other dependencies
+        :type ignore_depends_on_past: boolean
+        :param force: Forces a run regarless of previous success
+        :type force: boolean
+        :param mark_success: Don't run the task, mark its state as success
+        :type mark_success: boolean
+        :param test_mode: Doesn't record success or failure in the DB
+        :type test_mode: boolean
+        :param pool: specifies the pool to use to run the task instance
+        :type pool: str
         """
         task = self.task
         self.pool = pool or task.pool
@@ -1213,7 +1252,7 @@ class TaskInstance(Base):
             # todo: move this to the scheduler
                 self.state == State.UP_FOR_RETRY and
                 not self.ready_for_retry()):
-            next_run = (self.end_date + task.retry_delay).isoformat()
+            next_run = self.next_retry_datetime().isoformat()
             logging.info(
                 "Not ready for retry yet. " +
                 "Next run after {0}".format(next_run)
@@ -1421,6 +1460,24 @@ class TaskInstance(Base):
         if task.params:
             params.update(task.params)
 
+        class VariableAccessor:
+            """
+            Wrapper around Variable. This way you can get variables in templates by using
+            {var.variable_name}.
+            """
+            def __init__(self):
+                pass
+
+            def __getattr__(self, item):
+                return Variable.get(item)
+
+        class VariableJsonAccessor:
+            def __init__(self):
+                pass
+
+            def __getattr__(self, item):
+                return Variable.get(item, deserialize_json=True)
+
         return {
             'dag': task.dag,
             'ds': ds,
@@ -1446,6 +1503,10 @@ class TaskInstance(Base):
             'task_instance_key_str': ti_key_str,
             'conf': configuration,
             'test_mode': self.test_mode,
+            'var': {
+                'value': VariableAccessor(),
+                'json': VariableJsonAccessor()
+            }
         }
 
     def render_templates(self):
@@ -1644,6 +1705,12 @@ class BaseOperator(object):
     :type retries: int
     :param retry_delay: delay between retries
     :type retry_delay: timedelta
+    :param retry_exponential_backoff: allow progressive longer waits between
+        retries by using exponential backoff algorithm on retry delay (delay
+        will be converted into seconds)
+    :type retry_exponential_backoff: bool
+    :param max_retry_delay: maximum delay interval between retries
+    :type max_retry_delay: timedelta
     :param start_date: The ``start_date`` for the task, determines
         the ``execution_date`` for the first task instance. The best practice
         is to have the start_date rounded
@@ -1741,6 +1808,8 @@ class BaseOperator(object):
             email_on_failure=True,
             retries=0,
             retry_delay=timedelta(seconds=300),
+            retry_exponential_backoff=False,
+            max_retry_delay=None,
             start_date=None,
             end_date=None,
             schedule_interval=None,  # not hooked as of now
@@ -1816,6 +1885,8 @@ class BaseOperator(object):
         else:
             logging.debug("retry_delay isn't timedelta object, assuming secs")
             self.retry_delay = timedelta(seconds=retry_delay)
+        self.retry_exponential_backoff = retry_exponential_backoff
+        self.max_retry_delay = max_retry_delay
         self.params = params or {}  # Available in templates!
         self.adhoc = adhoc
         self.priority_weight = priority_weight
@@ -1836,6 +1907,8 @@ class BaseOperator(object):
             'email',
             'email_on_retry',
             'retry_delay',
+            'retry_exponential_backoff',
+            'max_retry_delay',
             'start_date',
             'schedule_interval',
             'depends_on_past',
@@ -1855,7 +1928,7 @@ class BaseOperator(object):
             all(self.__dict__.get(c, None) == other.__dict__.get(c, None)
                 for c in self._comps))
 
-    def __neq__(self, other):
+    def __ne__(self, other):
         return not self == other
 
     def __lt__(self, other):
@@ -2511,7 +2584,7 @@ class DAG(LoggingMixin):
             all(self.__dict__.get(c, None) == other.__dict__.get(c, None)
                 for c in self._comps))
 
-    def __neq__(self, other):
+    def __ne__(self, other):
         return not self == other
 
     def __lt__(self, other):
@@ -2566,6 +2639,21 @@ class DAG(LoggingMixin):
             return cron.get_prev(datetime)
         elif isinstance(self._schedule_interval, timedelta):
             return dttm - self._schedule_interval
+
+    def normalize_schedule(self, dttm):
+        """
+        Returns dttm + interval unless dttm is first interval then it returns dttm
+        """
+        following = self.following_schedule(dttm)
+
+        # in case of @once
+        if not following:
+            return dttm
+
+        if self.previous_schedule(following) != dttm:
+            return following
+
+        return dttm
 
     @property
     def tasks(self):
@@ -3346,10 +3434,12 @@ class DagRun(Base):
 
     @staticmethod
     @provide_session
-    def find(dag_id, run_id=None, execution_date=None,
+    def find(dag_id=None, run_id=None, execution_date=None,
              state=None, external_trigger=None, session=None):
         """
         Returns a set of dag runs for the given search criteria.
+        :param dag_id: the dag_id to find dag runs for
+        :type dag_id: integer, list
         :param run_id: defines the the run id for this dag run
         :type run_id: string
         :param execution_date: the execution date
@@ -3363,7 +3453,9 @@ class DagRun(Base):
         """
         DR = DagRun
 
-        qry = session.query(DR).filter(DR.dag_id == dag_id)
+        qry = session.query(DR)
+        if dag_id:
+            qry = qry.filter(DR.dag_id == dag_id)
         if run_id:
             qry = qry.filter(DR.run_id == run_id)
         if execution_date:

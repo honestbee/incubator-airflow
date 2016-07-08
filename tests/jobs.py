@@ -26,10 +26,12 @@ from airflow.bin import cli
 from airflow.executors import DEFAULT_EXECUTOR
 from airflow.jobs import BackfillJob, SchedulerJob
 from airflow.models import DAG, DagModel, DagBag, DagRun, Pool, TaskInstance as TI
-from airflow.operators import DummyOperator
+from airflow.operators.dummy_operator import DummyOperator
 from airflow.utils.db import provide_session
 from airflow.utils.state import State
 from airflow.utils.timeout import timeout
+
+from tests.executor.test_executor import TestExecutor
 
 from airflow import configuration
 configuration.test_mode()
@@ -44,6 +46,7 @@ except ImportError:
 
 DEV_NULL = '/dev/null'
 DEFAULT_DATE = datetime.datetime(2016, 1, 1)
+
 
 class BackfillJobTest(unittest.TestCase):
 
@@ -672,9 +675,7 @@ class SchedulerJobTest(unittest.TestCase):
 
         dr = scheduler.schedule_dag(dag)
         self.assertIsNotNone(dr)
-        print(dr.start_date)
         dr.start_date = datetime.datetime.now() - datetime.timedelta(days=1)
-        print(dr.start_date)
         session.merge(dr)
         session.commit()
 
@@ -683,4 +684,138 @@ class SchedulerJobTest(unittest.TestCase):
 
         dr.refresh_from_db(session=session)
         self.assertEquals(dr.state, State.FAILED)
+
+    def test_scheduler_verify_max_active_runs_and_dagrun_timeout(self):
+        """
+        Test if a a dagrun will not be scheduled if max_dag_runs has been reached and dagrun_timeout is not reached
+        Test if a a dagrun will be scheduled if max_dag_runs has been reached but dagrun_timeout is also reached
+        """
+        dag = DAG(
+            dag_id='test_scheduler_verify_max_active_runs_and_dagrun_timeout',
+            start_date=DEFAULT_DATE)
+        dag.max_active_runs = 1
+        dag.dagrun_timeout = datetime.timedelta(seconds=60)
+
+        dag_task1 = DummyOperator(
+            task_id='dummy',
+            dag=dag,
+            owner='airflow')
+
+        session = settings.Session()
+        orm_dag = DagModel(dag_id=dag.dag_id)
+        session.merge(orm_dag)
+        session.commit()
+        session.close()
+
+        scheduler = SchedulerJob()
+        dag.clear()
+
+        dr = scheduler.schedule_dag(dag)
+        self.assertIsNotNone(dr)
+
+        # Should not be scheduled as DagRun has not timedout and max_active_runs is reached
+        new_dr = scheduler.schedule_dag(dag)
+        self.assertIsNone(new_dr)
+
+        # Should be scheduled as dagrun_timeout has passed
+        dr.start_date = datetime.datetime.now() - datetime.timedelta(days=1)
+        session.merge(dr)
+        session.commit()
+        new_dr = scheduler.schedule_dag(dag)
+        self.assertIsNotNone(new_dr)
+
+    def test_scheduler_auto_align(self):
+        """
+        Test if the schedule_interval will be auto aligned with the start_date
+        such that if the start_date coincides with the schedule the first
+        execution_date will be start_date, otherwise it will be start_date +
+        interval.
+        """
+        dag = DAG(
+            dag_id='test_scheduler_auto_align_1',
+            start_date=datetime.datetime(2016, 1, 1, 10, 10, 0),
+            schedule_interval="4 5 * * *"
+        )
+        dag_task1 = DummyOperator(
+            task_id='dummy',
+            dag=dag,
+            owner='airflow')
+
+        session = settings.Session()
+        orm_dag = DagModel(dag_id=dag.dag_id)
+        session.merge(orm_dag)
+        session.commit()
+
+        scheduler = SchedulerJob()
+        dag.clear()
+
+        dr = scheduler.schedule_dag(dag)
+        self.assertIsNotNone(dr)
+        self.assertEquals(dr.execution_date, datetime.datetime(2016, 1, 2, 5, 4))
+
+        dag = DAG(
+            dag_id='test_scheduler_auto_align_2',
+            start_date=datetime.datetime(2016, 1, 1, 10, 10, 0),
+            schedule_interval="10 10 * * *"
+        )
+        dag_task1 = DummyOperator(
+            task_id='dummy',
+            dag=dag,
+            owner='airflow')
+
+        session = settings.Session()
+        orm_dag = DagModel(dag_id=dag.dag_id)
+        session.merge(orm_dag)
+        session.commit()
+
+        scheduler = SchedulerJob()
+        dag.clear()
+
+        dr = scheduler.schedule_dag(dag)
+        self.assertIsNotNone(dr)
+        self.assertEquals(dr.execution_date, datetime.datetime(2016, 1, 1, 10, 10))
+
+    def test_scheduler_reschedule(self):
+        """
+        Checks if tasks that are not taken up by the executor
+        get rescheduled
+        """
+        executor = TestExecutor()
+
+        dagbag = DagBag(executor=executor)
+        dagbag.dags.clear()
+        dagbag.executor = executor
+
+        dag = DAG(
+            dag_id='test_scheduler_reschedule',
+            start_date=DEFAULT_DATE)
+        dag_task1 = DummyOperator(
+            task_id='dummy',
+            dag=dag,
+            owner='airflow')
+
+        dag.clear()
+        dag.is_subdag = False
+
+        session = settings.Session()
+        orm_dag = DagModel(dag_id=dag.dag_id)
+        orm_dag.is_paused = False
+        session.merge(orm_dag)
+        session.commit()
+
+        dagbag.bag_dag(dag=dag, root_dag=dag, parent_dag=dag)
+
+        @mock.patch('airflow.models.DagBag', return_value=dagbag)
+        @mock.patch('airflow.models.DagBag.collect_dags')
+        def do_schedule(function, function2):
+            scheduler = SchedulerJob(num_runs=1, executor=executor,)
+            scheduler.heartrate = 0
+            scheduler.run()
+
+        do_schedule()
+        self.assertEquals(1, len(executor.queued_tasks))
+        executor.queued_tasks.clear()
+
+        do_schedule()
+        self.assertEquals(2, len(executor.queued_tasks))
 
